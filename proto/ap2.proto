@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package ap2;
+
+option go_package = "ap2/proto";
+
+// ─── Order Service ───────────────────────────────────────────────────────────
+
+service OrderService {
+  rpc CreateOrder (CreateOrderRequest) returns (CreateOrderResponse);
+  rpc GetOrder    (GetOrderRequest)    returns (GetOrderResponse);
+}
+
+message CreateOrderRequest {
+  string customer_email = 1;
+  double amount         = 2;
+}
+
+message CreateOrderResponse {
+  int32  order_id = 1;
+  string status   = 2;
+}
+
+message GetOrderRequest {
+  int32 order_id = 1;
+}
+
+message GetOrderResponse {
+  int32  order_id       = 1;
+  string customer_email = 2;
+  double amount         = 3;
+  string status         = 4;
+}
+
+// ─── Payment Service ─────────────────────────────────────────────────────────
+
+service PaymentService {
+  rpc ProcessPayment (ProcessPaymentRequest) returns (ProcessPaymentResponse);
+}
+
+message ProcessPaymentRequest {
+  int32  order_id       = 1;
+  double amount         = 2;
+  string customer_email = 3;
+}
+
+message ProcessPaymentResponse {
+  string status  = 1;
+  string message = 2;
+}
