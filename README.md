@@ -1,8 +1,9 @@
 # AP2 Assignment 3 – Event-Driven Architecture with Message Queues
 
-**Student:** Adildabek Nurassyl  
-**Group:** SE-2408  
-**Course:** Advanced Programming 2
+**Student:** Beknur Erdembek  
+**Group:** SE-2406  
+**Course:** Advanced Programming 2  
+**Repository:** https://github.com/yerdembek/AP2_ass3
 
 ---
 
