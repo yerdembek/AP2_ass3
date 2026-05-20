@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"time"
 
@@ -55,8 +56,11 @@ func (rl *RateLimiter) Wrap(next http.Handler) http.Handler {
 
 // ServeHTTP is the middleware entry point.
 func (rl *RateLimiter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Identify the client by IP address
+	// Identify the client by IP address (strip port from RemoteAddr)
 	clientIP := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		clientIP = host
+	}
 	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
 		clientIP = forwarded
 	}
