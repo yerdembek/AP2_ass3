@@ -6,18 +6,29 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
+	"time"
 
 	"google.golang.org/grpc"
 
+	"order-service/internal/cache"
 	"order-service/internal/handler"
+	"order-service/internal/middleware"
 	"order-service/internal/repository"
 	pb "order-service/proto"
 )
 
 func main() {
+	// ─── Configuration ────────────────────────────────────────────────────────
 	dbURL := getEnv("DB_URL", "postgres://ap2user:ap2pass@localhost:5432/ap2db?sslmode=disable")
 	paymentAddr := getEnv("PAYMENT_ADDR", "localhost:50052")
+	redisURL := getEnv("REDIS_URL", "redis://localhost:6379/0")
+
+	cacheTTLSecs, _ := strconv.Atoi(getEnv("CACHE_TTL_SECONDS", "300"))
+	rateLimitReqs, _ := strconv.Atoi(getEnv("RATE_LIMIT_REQUESTS", "10"))
+	rateLimitWindow, _ := strconv.Atoi(getEnv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+
 	grpcAddr := ":50051"
 	httpAddr := ":8080"
 
@@ -29,8 +40,19 @@ func main() {
 	defer repo.Close()
 	log.Println("[OrderService] Connected to PostgreSQL")
 
+	// ─── Redis Cache ──────────────────────────────────────────────────────────
+	ttl := time.Duration(cacheTTLSecs) * time.Second
+	orderCache, err := cache.NewOrderCache(redisURL, ttl)
+	if err != nil {
+		// Non-fatal: service works without cache, just slower
+		log.Printf("[OrderService] WARNING: Redis cache unavailable: %v — continuing without cache", err)
+		orderCache = nil
+	} else {
+		defer orderCache.Close()
+	}
+
 	// ─── Handler ─────────────────────────────────────────────────────────────
-	orderHandler, err := handler.NewOrderHandler(repo, paymentAddr)
+	orderHandler, err := handler.NewOrderHandler(repo, paymentAddr, orderCache)
 	if err != nil {
 		log.Fatalf("[OrderService] Failed to init handler: %v", err)
 	}
@@ -51,11 +73,24 @@ func main() {
 		}
 	}()
 
-	// ─── HTTP REST Server (for Postman testing) ───────────────────────────────
+	// ─── HTTP REST Server with Rate Limiter ───────────────────────────────────
 	httpHandler := handler.NewHTTPHandler(orderHandler)
+
+	// Wrap handler with rate limiter middleware (Bonus)
+	rateLimiter, err := middleware.NewRateLimiter(redisURL, rateLimitReqs, rateLimitWindow)
+	if err != nil {
+		log.Printf("[OrderService] WARNING: Rate limiter unavailable: %v — continuing without it", err)
+	}
+
+	var finalHandler http.Handler = httpHandler
+	if rateLimiter != nil {
+		finalHandler = rateLimiter.Wrap(httpHandler)
+		defer rateLimiter.Close()
+	}
+
 	httpServer := &http.Server{
 		Addr:    httpAddr,
-		Handler: httpHandler,
+		Handler: finalHandler,
 	}
 
 	go func() {

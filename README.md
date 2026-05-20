@@ -1,298 +1,259 @@
-# AP2 Assignment 3 – Event-Driven Architecture with Message Queues
+# AP2 Microservices — Assignment 4: Performance Optimization & External Integrations
 
-**Student:** Beknur Erdembek  
-**Group:** SE-2406  
-**Course:** Advanced Programming 2  
-**Repository:** https://github.com/yerdembek/AP2_ass3
+A production-ready microservices system built with Go, PostgreSQL, RabbitMQ, and Redis.
+Implements Redis Caching, the Adapter Pattern, Parallel Background Workers with Exponential Backoff, and a Redis Rate Limiter.
 
 ---
 
 ## Architecture Overview
 
-This project implements an **event-driven microservices architecture** using gRPC for synchronous service-to-service communication and RabbitMQ for asynchronous event publishing. A REST HTTP gateway is exposed on port `8080` for external clients (e.g., Postman).
-
 ```
-[Client / Postman]
-       │
-       │  HTTP REST  (POST /orders, GET /orders/{id})
-       ▼
-[Order Service  :8080 / :50051]
-       │
-       │  gRPC (synchronous call)
-       ▼
-[Payment Service  :50052]
-       │
-       ├─── DB Transaction → PostgreSQL (payments table)
-       │
-       └─── Publish JSON Event → RabbitMQ
-                Exchange : payments        (direct, durable)
-                Queue    : payment.completed (durable, DLX-backed)
-                DLX      : payments.dlx
-                DLQ      : payment.dead_letter
-                       │
-                       ▼
-            [Notification Service]
-            (RabbitMQ consumer – fully decoupled)
-                       │
-                       ├─── Idempotency Check  →  processed_events (PostgreSQL)
-                       ├─── Log email simulation
-                       └─── Manual ACK  →  RabbitMQ
+ ┌─────────────────────────────────────────────────────────────────┐
+ │  Client (Postman / curl)                                        │
+ └───────────────────────┬─────────────────────────────────────────┘
+                         │ HTTP REST
+                         ▼
+ ┌───────────────────────────────────────────────────────────────┐
+ │  Order Service  (:8080 HTTP / :50051 gRPC)                    │
+ │                                                               │
+ │  ┌──────────────────┐   ┌──────────────────────────────────┐  │
+ │  │  Rate Limiter    │   │  Cache-Aside (Redis)             │  │
+ │  │  Middleware      │   │  GET /orders/:id                 │  │
+ │  │  (Redis INCR)    │   │  → Redis HIT → return fast       │  │
+ │  │  HTTP 429 on     │   │  → Redis MISS → DB → cache.Set   │  │
+ │  │  limit exceeded  │   │  On status change → cache.Delete │  │
+ │  └──────────────────┘   └──────────────────────────────────┘  │
+ └────────────────────────────┬──────────────────────────────────┘
+                              │ gRPC
+                              ▼
+ ┌──────────────────────────────────────────────────────────────┐
+ │  Payment Service  (:50052 gRPC)                              │
+ │  Processes payment → publishes PaymentEvent to RabbitMQ      │
+ └────────────────────────────┬─────────────────────────────────┘
+                              │ AMQP (payment.completed queue)
+                              ▼
+ ┌──────────────────────────────────────────────────────────────┐
+ │  Notification Service (Background Worker Pool)               │
+ │                                                              │
+ │  ┌───────────┐  ┌───────────┐  ┌───────────┐                │
+ │  │ Worker 1  │  │ Worker 2  │  │ Worker 3  │  ← parallel    │
+ │  │ (barista) │  │ (barista) │  │ (barista) │    goroutines  │
+ │  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘               │
+ │        └──────────────┼──────────────┘                      │
+ │                       │                                      │
+ │  ┌──────────────────────────────────────────────────┐        │
+ │  │ Redis Idempotency (SET NX)                       │        │
+ │  │ → if already processed: ACK & skip               │        │
+ │  └──────────────────────────────────────────────────┘        │
+ │                       │                                      │
+ │  ┌──────────────────────────────────────────────────┐        │
+ │  │ sendWithRetry (Exponential Backoff)               │        │
+ │  │   attempt 1 → fail → sleep 2s                    │        │
+ │  │   attempt 2 → fail → sleep 4s                    │        │
+ │  │   attempt 3 → success → ACK                      │        │
+ │  │   all failed → NACK → DLQ                        │        │
+ │  └──────────────────────────────────────────────────┘        │
+ │                       │                                      │
+ │  ┌──────────────────────────────────────────────────┐        │
+ │  │ EmailSender interface (Adapter Pattern)           │        │
+ │  │   SIMULATED: random latency + 30% failure rate   │        │
+ │  │   REAL:      SMTP via net/smtp + STARTTLS         │        │
+ │  └──────────────────────────────────────────────────┘        │
+ └──────────────────────────────────────────────────────────────┘
+
+Shared Infrastructure: Redis | PostgreSQL | RabbitMQ
 ```
 
 ---
 
-## Services
+## Quick Start
 
-| Service | Port(s) | Protocol | Role |
-|---|---|---|---|
-| **Order Service** | `8080` (HTTP), `50051` (gRPC) | REST + gRPC | Receives orders, persists to DB, calls Payment Service |
-| **Payment Service** | `50052` | gRPC | Processes payment, commits to DB, publishes RabbitMQ event |
-| **Notification Service** | — | RabbitMQ Consumer | Listens on `payment.completed`, deduplicates, logs email |
-| **PostgreSQL** | `5432` | — | Shared database (`orders`, `payments`, `processed_events`) |
-| **RabbitMQ** | `5672` (AMQP), `15672` (UI) | AMQP 0-9-1 | Message broker with DLX/DLQ support |
+```bash
+docker-compose up --build
+```
 
-### Project Structure
+Services start in order: PostgreSQL → RabbitMQ → Redis → payment-service → order-service → notification-service.
+
+### Test the API
+
+```bash
+# Create an order (triggers payment + notification pipeline)
+curl -X POST http://localhost:8080/orders \
+  -H "Content-Type: application/json" \
+  -d '{"customer_email":"test@example.com","amount":99.99}'
+
+# Get order — first call hits DB and populates Redis cache
+curl http://localhost:8080/orders/1
+
+# Second call — served from Redis cache (no DB query)
+curl http://localhost:8080/orders/1
+```
+
+### Rate Limiter Test (Bonus)
+
+```bash
+# Send 11+ requests — the 11th returns HTTP 429
+for i in $(seq 1 12); do curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/orders/1; done
+```
+
+---
+
+## Assignment 4 Features
+
+### 1. Redis Cache-Aside Pattern (Order Service)
+
+**Strategy:** Cache-Aside (Lazy Loading)
+
+- **Read path (`GET /orders/:id`):**
+  1. Check Redis key `order:<id>`
+  2. **Cache HIT** → return cached JSON (no DB query, low latency)
+  3. **Cache MISS** → query PostgreSQL → populate Redis in background goroutine → return result
+
+- **Invalidation (atomic):** After `UpdateOrderStatus()` is called in the DB, the handler immediately calls `cache.Delete(orderID)`. This prevents serving stale data (e.g., showing "pending" status after a successful payment).
+
+- **TTL:** Configurable via `CACHE_TTL_SECONDS` (default: 300s / 5 minutes). Even if invalidation fails, the key auto-expires.
+
+**Redis key format:** `order:<id>`
+
+### 2. Email Adapter Pattern (Notification Service)
+
+The `EmailSender` interface decouples the worker from vendor-specific code:
+
+```go
+type EmailSender interface {
+    Send(to, subject, body string) error
+}
+```
+
+| `PROVIDER_MODE` | Implementation | Behavior |
+|---|---|---|
+| `SIMULATED` (default) | `SimulatedEmailSender` | 100–500ms latency + 30% random failure rate |
+| `REAL` | `SMTPEmailSender` | Real SMTP via `net/smtp` with STARTTLS |
+
+The consumer never changes — only the implementation injected at startup changes. This is the **Adapter Pattern**.
+
+### 3. Parallel Background Workers (Barista Model)
+
+The notification service runs **N parallel goroutines** (configured via `NUM_WORKERS`, default: 3). Each goroutine is an independent worker that:
+
+1. Reads messages from the shared RabbitMQ queue concurrently
+2. Checks Redis for duplicate detection (`EXISTS notif:processed:<eventID>`)
+3. Calls `sendWithRetry()` with **exponential backoff**
+4. Marks as processed with `SET NX` (atomic — prevents two workers processing the same event)
+5. Sends `ACK` or `NACK` to RabbitMQ
+
+This is analogous to multiple baristas at a coffee shop: they all take orders from the same queue simultaneously, each handles their own order independently, and they retry if the coffee machine fails.
+
+### 4. Exponential Backoff Retry
 
 ```
-AP2_ass3/
-├── docker-compose.yml
-├── init.sql                          # DB schema (orders, payments, processed_events)
-├── proto/                            # Shared .proto definitions
+attempt 1 → fail → sleep 2s   (baseDelay * 2^0)
+attempt 2 → fail → sleep 4s   (baseDelay * 2^1)
+attempt 3 → fail → sleep 8s   (baseDelay * 2^2)
+attempt N → all failed → NACK → Dead Letter Queue
+```
+
+Configured via: `MAX_RETRIES=3`, `RETRY_BASE_SECONDS=2`.
+
+### 5. Redis Idempotency (Notification Service)
+
+Before sending any notification, each worker checks:
+```
+EXISTS notif:processed:<eventID>
+```
+- **Found** → ACK and skip (no duplicate email sent)
+- **Not found** → process, then `SET NX notif:processed:<eventID> 1 EX <48h>`
+
+`SET NX` (Set if Not eXists) is atomic — if two workers race, only one wins and the other safely skips.
+
+**TTL:** 48h (`IDEMPOTENCY_TTL_HOURS=48`) — keys auto-expire to prevent unbounded growth.
+
+### 6. Redis Rate Limiter — Bonus (+10%)
+
+HTTP middleware on the Order Service using the **Fixed Window** algorithm:
+
+```
+INCR rate:<clientIP>   → atomically increment counter
+EXPIRE (on first hit)  → set window expiry
+if counter > limit     → HTTP 429 Too Many Requests
+```
+
+Configured via: `RATE_LIMIT_REQUESTS=10`, `RATE_LIMIT_WINDOW_SECONDS=60`.
+Returns `Retry-After` header with the window duration.
+
+---
+
+## Configuration (`.env`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `REDIS_URL` | `redis://redis:6379/0` | Redis connection URL |
+| `CACHE_TTL_SECONDS` | `300` | Order cache TTL (5 min) |
+| `RATE_LIMIT_REQUESTS` | `10` | Max requests per window |
+| `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate limit window size |
+| `PROVIDER_MODE` | `SIMULATED` | `SIMULATED` or `REAL` |
+| `NUM_WORKERS` | `3` | Parallel notification workers |
+| `MAX_RETRIES` | `3` | Max retry attempts per notification |
+| `RETRY_BASE_SECONDS` | `2` | Base delay for exponential backoff |
+| `IDEMPOTENCY_TTL_HOURS` | `48` | Redis idempotency key lifetime |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` | — | SMTP config (only for `REAL` mode) |
+
+---
+
+## Inspect Redis State
+
+```bash
+# List all cached orders
+docker exec -it redis redis-cli KEYS "order:*"
+
+# Inspect a cached order
+docker exec -it redis redis-cli GET "order:1"
+
+# List processed notification events
+docker exec -it redis redis-cli KEYS "notif:processed:*"
+
+# Inspect rate limiter counters
+docker exec -it redis redis-cli KEYS "rate:*"
+docker exec -it redis redis-cli GET "rate:172.17.0.1"
+```
+
+---
+
+## Project Structure
+
+```
+ap2_ass3/
+├── docker-compose.yml          # Infrastructure: PG + RabbitMQ + Redis + services
+├── .env                        # All configuration
+├── init.sql                    # DB schema
 ├── order-service/
-│   ├── cmd/main.go                   # Starts gRPC + HTTP servers
-│   └── internal/
-│       ├── handler/
-│       │   ├── order_handler.go      # gRPC handler – CreateOrder, GetOrder
-│       │   └── http_handler.go       # REST gateway – POST/GET /orders
-│       └── repository/order_repo.go  # PostgreSQL queries
+│   ├── internal/
+│   │   ├── cache/
+│   │   │   └── order_cache.go          # Redis Cache-aside implementation
+│   │   ├── handler/
+│   │   │   ├── order_handler.go        # gRPC handler with cache integration
+│   │   │   └── http_handler.go         # REST gateway
+│   │   ├── middleware/
+│   │   │   └── rate_limiter.go         # Redis rate limiter (Bonus)
+│   │   └── repository/
+│   │       └── order_repo.go           # PostgreSQL repository
+│   └── cmd/main.go
 ├── payment-service/
-│   ├── cmd/main.go
-│   └── internal/
-│       ├── handler/                  # gRPC handler – ProcessPayment
-│       ├── messaging/publisher.go    # RabbitMQ publisher + topology declaration
-│       └── repository/               # PostgreSQL queries
+│   ├── internal/
+│   │   ├── handler/                    # gRPC payment handler
+│   │   ├── messaging/                  # RabbitMQ publisher
+│   │   └── repository/                 # PostgreSQL repository
+│   └── cmd/main.go
 └── notification-service/
-    ├── cmd/main.go
-    └── internal/
-        ├── consumer/
-        │   └── notification_consumer.go  # RabbitMQ consumer + ACK logic
-        └── repository/                   # Idempotency store (processed_events)
-```
-
----
-
-## How to Run
-
-### Prerequisites
-
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running
-
-### Start all services
-
-```bash
-docker compose up --build -d
-```
-
-### Verify all containers are healthy
-
-```bash
-docker ps
-```
-
-Expected output – all five containers should show `Up`:
-
-```
-NAMES                  STATUS           PORTS
-order-service          Up X seconds     0.0.0.0:8080->8080/tcp, 0.0.0.0:50051->50051/tcp
-payment-service        Up X seconds     0.0.0.0:50052->50052/tcp
-notification-service   Up X seconds
-postgres               Up X seconds (healthy)   0.0.0.0:5432->5432/tcp
-rabbitmq               Up X seconds (healthy)   0.0.0.0:5672->5672/tcp, 0.0.0.0:15672->15672/tcp
-```
-
-### Stop all services
-
-```bash
-docker compose down
-```
-
-### RabbitMQ Management UI
-
-Open in browser: **http://localhost:15672**  
-Credentials: `guest` / `guest`
-
----
-
-## Idempotency Strategy
-
-**Problem:** RabbitMQ guarantees *at-least-once* delivery. If the Notification Service crashes after processing a message but before sending the ACK, RabbitMQ redelivers the same message. Without a guard, the same notification would be logged (or sent) twice.
-
-**Solution – Database-backed deduplication via `processed_events` table:**
-
-```sql
--- Created by init.sql
-CREATE TABLE IF NOT EXISTS processed_events (
-    event_id     VARCHAR(255) PRIMARY KEY,
-    processed_at TIMESTAMP DEFAULT NOW()
-);
-```
-
-Processing flow for every incoming message:
-
-1. Every `PaymentEvent` published by the Payment Service includes a unique `event_id` (UUID v4).
-2. Notification Service queries the table before doing any work:
-   ```sql
-   SELECT event_id FROM processed_events WHERE event_id = $1
-   ```
-3. **Duplicate found** → silently `ACK` the message and skip — no side effects.
-4. **Not a duplicate** → execute business logic (log email) → insert `event_id` into `processed_events` → `ACK`.
-
-This guarantees **exactly-once effect** even under at-least-once delivery semantics.
-
----
-
-## ACK Logic
-
-Manual acknowledgment is enabled by setting `autoAck = false` when the consumer registers:
-
-```go
-// notification-service/internal/consumer/notification_consumer.go
-deliveries, err := c.channel.Consume(
-    QueueName,
-    "notification-consumer", // consumer tag
-    false,                   // autoAck = false  ← Manual ACK
-    false, false, false, nil,
-)
-```
-
-The `ACK` is sent **only after all of the following succeed**:
-
-| Step | Action |
-|---|---|
-| 1 | Message body parsed successfully (JSON → `PaymentEvent`) |
-| 2 | Idempotency check passes (no duplicate in `processed_events`) |
-| 3 | Business logic executed (email log printed) |
-| 4 | `event_id` inserted into `processed_events` |
-| 5 | `d.Ack(false)` called |
-
-If the service crashes at **any step before step 5**, RabbitMQ redelivers the message — preserving the at-least-once guarantee without data loss.
-
-**NACK behaviour:**
-
-| Scenario | Action | Result |
-|---|---|---|
-| JSON parse error (unrecoverable) | `Nack(requeue=false)` | Message routed to DLQ |
-| DB / idempotency error (transient) | `Nack(requeue=true)` | Message requeued for retry |
-
----
-
-## Reliability Features
-
-| Feature | Implementation |
-|---|---|
-| **Durable queues** | `QueueDeclare(..., durable=true, ...)` – messages survive broker restart |
-| **Persistent messages** | `DeliveryMode: amqp.Persistent` set in publisher |
-| **Manual ACKs** | `autoAck=false`; ACK sent only after successful end-to-end processing |
-| **Idempotency** | `processed_events` table; duplicate `event_id` → silent skip |
-| **Prefetch limit** | `ch.Qos(1, 0, false)` – processes one message at a time (fair dispatch) |
-| **Graceful Shutdown** | `os/signal` in all services; gRPC `GracefulStop()` on SIGINT/SIGTERM |
-| **Retry on startup** | All services retry connecting to Postgres/RabbitMQ up to 10 times (3 s apart) |
-| **Dead Letter Queue** | Messages nacked with `requeue=false` are automatically moved to `payment.dead_letter` |
-
----
-
-## Dead Letter Queue (Bonus)
-
-The main queue `payment.completed` is declared with a Dead-Letter Exchange (DLX):
-
-```go
-// payment-service/internal/messaging/publisher.go
-args := amqp.Table{
-    "x-dead-letter-exchange":    "payments.dlx",
-    "x-dead-letter-routing-key": "payment.completed",
-}
-ch.QueueDeclare("payment.completed", true, false, false, false, args)
-```
-
-The DLX (`payments.dlx`) routes failed messages to the DLQ (`payment.dead_letter`):
-
-```go
-ch.ExchangeDeclare("payments.dlx", "direct", true, false, false, false, nil)
-ch.QueueDeclare("payment.dead_letter", true, false, false, false, nil)
-ch.QueueBind("payment.dead_letter", "payment.completed", "payments.dlx", false, nil)
-```
-
-**When does a message go to the DLQ?**
-- The consumer calls `Nack(false, false)` — for example on an unrecoverable JSON parse error.
-- RabbitMQ automatically routes it via DLX to `payment.dead_letter`.
-
-**Monitoring:** Open **http://localhost:15672 → Queues** to see message counts in `payment.completed` and `payment.dead_letter` in real time.
-
----
-
-## Event Payload (JSON)
-
-The `PaymentEvent` struct is serialized to JSON and published to the `payments` exchange:
-
-```json
-{
-  "event_id":       "550e8400-e29b-41d4-a716-446655440000",
-  "order_id":       1,
-  "amount":         99.99,
-  "customer_email": "user@example.com",
-  "status":         "completed",
-  "occurred_at":    "2026-05-02T10:00:00Z"
-}
-```
-
-| Field | Type | Description |
-|---|---|---|
-| `event_id` | `string` (UUID v4) | Unique message ID used for idempotency deduplication |
-| `order_id` | `int32` | References the `orders` table |
-| `amount` | `float64` | Payment amount |
-| `customer_email` | `string` | Recipient email address |
-| `status` | `string` | Always `"completed"` for successfully processed payments |
-| `occurred_at` | `string` (RFC3339) | Timestamp of the payment event |
-
----
-
-## Expected Console Output
-
-After sending a `POST /orders` request, all three services produce logs showing the full event-driven chain:
-
-**Order Service:**
-```
-[OrderService] Connected to PostgreSQL
-[OrderService] HTTP REST server listening on :8080
-[OrderService] gRPC server listening on :50051
-[OrderService] CreateOrder: email=user@example.com amount=99.99
-[OrderService] Order #1 created in DB
-[OrderService] Order #1 status updated to 'completed'
-```
-
-**Payment Service:**
-```
-[PaymentService] Connected to PostgreSQL
-[Publisher] RabbitMQ topology declared (queue, DLX, DLQ)
-[PaymentService] gRPC server listening on :50052
-[PaymentService] ProcessPayment: order_id=1 amount=99.99 email=user@example.com
-[PaymentService] Payment for order #1 committed to DB
-[Publisher] Event published: event_id=c5576dbc-ac2a-4e0b-937c-10805e0037a8 order_id=1
-```
-
-**Notification Service:**
-```
-[NotificationService] Connected to PostgreSQL (idempotency store)
-[Consumer] Connected to RabbitMQ, queue ready
-[NotificationService] Starting consumer...
-[Consumer] Waiting for messages on queue: payment.completed
-[Notification] Sent email to user@example.com for Order #1. Amount: $99.99
-```
-
-To view logs in real time:
-
-```bash
-docker logs order-service --follow
-docker logs payment-service --follow
-docker logs notification-service --follow
+    ├── internal/
+    │   ├── provider/
+    │   │   ├── email_sender.go         # EmailSender interface (Adapter)
+    │   │   ├── simulated_provider.go   # Mock with latency + random failures
+    │   │   └── smtp_provider.go        # Real SMTP adapter
+    │   ├── consumer/
+    │   │   └── notification_consumer.go # Parallel worker pool + retry + backoff
+    │   └── repository/
+    │       ├── idempotency_store.go         # PostgreSQL idempotency (fallback)
+    │       └── redis_idempotency_store.go   # Redis idempotency (primary)
+    └── cmd/main.go
 ```
